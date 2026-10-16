@@ -1,13 +1,16 @@
 {
-  "compilerOptions": {
-    "target": "ES2022",
-    "module": "preserve",
-    "jsx": "react-jsx",
-    "strict": true,
-    "moduleResolution": "bundler",
-    "verbatimModuleSyntax": true,
-    "skipLibCheck": true,
-    "outDir": "dist"
-  },
-  "include": ["src"]
+	"compilerOptions": {
+		"target": "ES2022",
+		"lib": ["ES2022", "DOM", "DOM.Iterable"],
+		"module": "preserve",
+		"moduleResolution": "bundler",
+		"jsx": "react-jsx",
+		"strict": true,
+		"noEmit": true,
+		"skipLibCheck": true,
+		"verbatimModuleSyntax": true,
+		"isolatedModules": true,
+		"types": ["node"]
+	},
+	"include": ["src", "tests"]
 }

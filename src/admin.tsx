@@ -1,543 +1,717 @@
-import React, { useState, useEffect, useCallback, useRef } from "react";
-import { createPortal } from "react-dom";
+// Trusted React admin: settings page, restrictions page, dashboard widget, and the
+// "Restrict With Stripe" editor panel. All calls go through apiFetch(), which adds
+// the X-EmDash-Request header that cookie-authenticated private routes require.
+
+import { apiFetch, parseApiResponse } from "emdash/plugin-utils";
+import * as React from "react";
+
+import { REQUIRED_PERMISSIONS } from "./lib/permission-list.js";
 
 const API = "/_emdash/api/plugins/restrict-with-stripe";
-const HEADERS: Record<string, string> = { "X-EmDash-Request": "1", "Content-Type": "application/json" };
+const STATE_PARAM = "rwstripe_state";
 
-async function api(path: string, opts?: RequestInit) {
-  const res = await fetch(`${API}${path}`, { ...opts, headers: { ...HEADERS, ...opts?.headers } });
-  const json = await res.json();
-  return json.data || json;
+async function call<T>(route: string, payload: Record<string, unknown> = {}): Promise<T> {
+	const response = await apiFetch(`${API}/${route}`, {
+		method: "POST",
+		headers: { "Content-Type": "application/json" },
+		body: JSON.stringify(payload),
+	});
+	return parseApiResponse<T>(response, "Request failed");
 }
 
-// ═══════════════════════════════════════════════════════════════════
-// Settings Page
-// ═══════════════════════════════════════════════════════════════════
+function errorText(error: unknown): string {
+	return error instanceof Error ? error.message : String(error);
+}
+
+interface Settings {
+	configured: boolean;
+	keySource: "connect" | "manual" | null;
+	environment: "live" | "sandbox" | null;
+	accountId: string | null;
+	key: { type: "secret" | "restricted"; last4: string } | null;
+	publishableKeySet: boolean;
+	connectHashed: boolean;
+	showExcerpts: boolean;
+	siteUrl: string | null;
+	emailConfigured: boolean;
+	encryptionError: boolean;
+	permissionError: { permission: string | null; operation: string; at: string; message: string } | null;
+	permissionReport: PermissionReport | null;
+}
+
+interface KeyHealth {
+	configured: boolean;
+	ok: boolean;
+	needsReconnect: boolean;
+	needsNewKey: boolean;
+	keyType?: "secret" | "restricted";
+	message?: string;
+	permissionError?: string | null;
+	error?: string;
+}
+
+interface PermissionReport {
+	keyType: "secret" | "restricted";
+	invalidKey: boolean;
+	ok: boolean;
+	checkedAt: string;
+	results: Array<{ label: string; optional: boolean; status: "ok" | "missing" | "unverified" | "error"; message: string }>;
+}
+
+interface Product {
+	id: string;
+	name: string;
+	description: string | null;
+	priceId: string | null;
+	price: string | null;
+}
+
+interface RestrictionItem {
+	collectionSlug: string;
+	contentId: string;
+	productIds: string[];
+	title: string | null;
+	slug: string | null;
+}
+
+// ─── Shared UI ───────────────────────────────────────────────────
+
+const muted: React.CSSProperties = { opacity: 0.7, fontSize: 13 };
+const buttonStyle: React.CSSProperties = {
+	padding: "8px 16px",
+	background: "#635bff",
+	color: "#fff",
+	border: "none",
+	borderRadius: 6,
+	cursor: "pointer",
+	fontSize: 14,
+	fontWeight: 500,
+};
+const secondaryButton: React.CSSProperties = {
+	...buttonStyle,
+	background: "transparent",
+	color: "inherit",
+	border: "1px solid currentColor",
+	opacity: 0.85,
+};
+const linkButton: React.CSSProperties = {
+	background: "none",
+	border: "none",
+	padding: 0,
+	color: "#635bff",
+	cursor: "pointer",
+	textDecoration: "underline",
+	font: "inherit",
+};
+
+function Section({ title, children }: { title: string; children: React.ReactNode }) {
+	return (
+		<section style={{ marginBottom: 28 }}>
+			<h3 style={{ fontSize: 15, fontWeight: 600, marginBottom: 8 }}>{title}</h3>
+			{children}
+		</section>
+	);
+}
+
+function Notice({ tone, children }: { tone: "info" | "warn" | "error" | "ok"; children: React.ReactNode }) {
+	const colors = { info: "#635bff", warn: "#b45309", error: "#dc2626", ok: "#059669" };
+	return (
+		<div
+			role={tone === "error" ? "alert" : "status"}
+			style={{ borderLeft: `3px solid ${colors[tone]}`, padding: "8px 12px", margin: "8px 0", fontSize: 14 }}
+		>
+			{children}
+		</div>
+	);
+}
+
+// ─── Restricted key permissions ──────────────────────────────────
+
+const cell: React.CSSProperties = { padding: "4px 8px", borderBottom: "1px solid rgba(127,127,127,0.25)", textAlign: "left", verticalAlign: "top" };
+
+function PermissionChecklist() {
+	return (
+		<table style={{ borderCollapse: "collapse", fontSize: 13, width: "100%", margin: "8px 0" }}>
+			<thead>
+				<tr>
+					<th style={cell}>Resource</th>
+					<th style={cell}>Permission</th>
+					<th style={cell}>Used for</th>
+				</tr>
+			</thead>
+			<tbody>
+				{REQUIRED_PERMISSIONS.map((permission) => (
+					<tr key={permission.resource}>
+						<td style={cell}>{permission.label}</td>
+						<td style={cell}>
+							<strong>{permission.access === "write" ? "Write" : "Read"}</strong>
+							{permission.optional ? " (optional)" : ""}
+						</td>
+						<td style={cell}>{permission.usedFor}</td>
+					</tr>
+				))}
+				<tr>
+					<td style={cell}>Everything else</td>
+					<td style={cell}>
+						<strong>None</strong>
+					</td>
+					<td style={cell}>Not used by this plugin.</td>
+				</tr>
+			</tbody>
+		</table>
+	);
+}
+
+const statusText = { ok: "OK", missing: "Missing", unverified: "Checked on first use", error: "Unknown" } as const;
+const statusColor = { ok: "#059669", missing: "#dc2626", unverified: "#b45309", error: "#b45309" } as const;
+
+function PermissionResults({ report }: { report: PermissionReport }) {
+	if (report.invalidKey) {
+		return <Notice tone="error">Stripe rejected this key, so its permissions could not be checked. Update your restricted key.</Notice>;
+	}
+	return (
+		<>
+			<table style={{ borderCollapse: "collapse", fontSize: 13, width: "100%", margin: "8px 0" }}>
+				<tbody>
+					{report.results.map((result) => (
+						<tr key={result.label}>
+							<td style={cell}>{result.label}</td>
+							<td style={{ ...cell, color: statusColor[result.status], fontWeight: 600, whiteSpace: "nowrap" }}>
+								{result.optional && result.status === "missing" ? "Not granted" : statusText[result.status]}
+							</td>
+							<td style={cell}>{result.message}</td>
+						</tr>
+					))}
+				</tbody>
+			</table>
+			<p style={muted}>Checked {new Date(report.checkedAt).toLocaleString()} with read-only requests.</p>
+		</>
+	);
+}
+
+// ─── Settings page ───────────────────────────────────────────────
+
+function readConnectReturn(): { action: "complete-connect" | "complete-disconnect"; params: Record<string, string> } | null {
+	const search = new URLSearchParams(window.location.search);
+	if (!search.has(STATE_PARAM)) return null;
+	const params: Record<string, string> = {};
+	search.forEach((value, key) => {
+		params[key] = value;
+	});
+	if (search.has("pmpro_stripe_connected")) return { action: "complete-connect", params };
+	if (search.has("pmpro_stripe_disconnected")) return { action: "complete-disconnect", params };
+	return null;
+}
+
 function SettingsPage() {
-  const [settings, setSettings] = useState<any>(null);
-  const [saving, setSaving] = useState(false);
-  const [msg, setMsg] = useState("");
-  const [testMode, setTestMode] = useState(false);
+	const [settings, setSettings] = React.useState<Settings | null>(null);
+	const [health, setHealth] = React.useState<KeyHealth | null>(null);
+	const [message, setMessage] = React.useState<{ tone: "ok" | "error"; text: string } | null>(null);
+	const [busy, setBusy] = React.useState(false);
+	const [sandbox, setSandbox] = React.useState(false);
+	const [manualKey, setManualKey] = React.useState("");
+	const [manualOpen, setManualOpen] = React.useState(false);
 
-  const CONNECT_URL = "https://connect.restrictwithstripe.com";
+	const load = React.useCallback(async () => {
+		try {
+			setSettings(await call<Settings>("admin/settings", { action: "get" }));
+			setHealth(await call<KeyHealth>("admin/key-health"));
+		} catch (error) {
+			setMessage({ tone: "error", text: errorText(error) });
+		}
+	}, []);
 
-  useEffect(() => {
-    const params = new URLSearchParams(window.location.search);
-    const cleanUrl = window.location.pathname + "?page=rwstripe";
+	React.useEffect(() => {
+		const pending = readConnectReturn();
+		if (!pending) {
+			void load();
+			return;
+		}
+		// Drop the returned keys and state from the address bar before anything else.
+		window.history.replaceState(null, "", window.location.pathname);
+		call<{ ok: boolean; message: string }>("admin/connect", { action: pending.action, params: pending.params })
+			.then((result) => setMessage({ tone: result.ok ? "ok" : "error", text: result.message }))
+			.catch((error) => setMessage({ tone: "error", text: errorText(error) }))
+			.finally(() => void load());
+	}, [load]);
 
-    if (params.get("pmpro_stripe_connected") === "true") {
-      const connectData = {
-        stripeSecretKey: params.get("pmpro_stripe_access_token") || "",
-        stripePublishableKey: params.get("pmpro_stripe_publishable_key") || "",
-        stripeAccountId: params.get("pmpro_stripe_user_id") || "",
-        stripeEnvironment: params.get("pmpro_stripe_connected_environment") || "live",
-      };
-      api("/admin/settings", { method: "POST", body: JSON.stringify(connectData) })
-        .then(() => api("/admin/settings"))
-        .then(s => { setSettings(s); setMsg("Connected to Stripe!"); })
-        .catch(() => setMsg("Error saving Stripe credentials."));
-      window.history.replaceState({}, "", cleanUrl);
-    } else if (params.get("pmpro_stripe_connected") === "false") {
-      setMsg(params.get("error_message") || "Failed to connect to Stripe.");
-      window.history.replaceState({}, "", cleanUrl);
-      api("/admin/settings").then(setSettings);
-    } else if (params.get("pmpro_stripe_disconnected") === "true") {
-      setMsg("Disconnected from Stripe.");
-      api("/admin/settings").then(setSettings);
-      window.history.replaceState({}, "", cleanUrl);
-    } else {
-      api("/admin/settings").then(setSettings);
-    }
-  }, []);
+	const startFlow = async (action: "start-connect" | "start-disconnect") => {
+		setBusy(true);
+		setMessage(null);
+		try {
+			const { url } = await call<{ url: string }>("admin/connect", {
+				action,
+				environment: sandbox ? "sandbox" : "live",
+			});
+			window.location.assign(url);
+		} catch (error) {
+			setMessage({ tone: "error", text: errorText(error) });
+			setBusy(false);
+		}
+	};
 
-  function buildConnectUrl() {
-    const returnUrl = window.location.origin + window.location.pathname + "?page=rwstripe";
-    const env = testMode ? "sandbox" : "live";
-    return `${CONNECT_URL}?action=authorize&gateway_environment=${env}&return_url=${encodeURIComponent(returnUrl)}`;
-  }
+	const save = async (payload: Record<string, unknown>, done: string) => {
+		setBusy(true);
+		setMessage(null);
+		try {
+			const next = await call<Settings>("admin/settings", { action: "save", ...payload });
+			setSettings(next);
+			setHealth(await call<KeyHealth>("admin/key-health"));
+			const report = payload.secretKey ? next.permissionReport : null;
+			setMessage(
+				report && !report.ok
+					? { tone: "error", text: "Key saved, but it is missing permissions. See the check results below." }
+					: { tone: "ok", text: done },
+			);
+			setManualKey("");
+			setManualOpen(false);
+		} catch (error) {
+			setMessage({ tone: "error", text: errorText(error) });
+		}
+		setBusy(false);
+	};
 
-  async function disconnect() {
-    if (!confirm("Disconnect from Stripe?")) return;
-    setSaving(true);
-    const returnUrl = window.location.origin + window.location.pathname + "?page=rwstripe";
-    const env = settings.stripeEnvironment === "test" ? "sandbox" : "live";
-    const disconnectUrl = `${CONNECT_URL}?action=disconnect&gateway_environment=${env}&stripe_user_id=${settings.stripeAccountId || ""}&return_url=${encodeURIComponent(returnUrl)}`;
-    await api("/admin/settings", { method: "POST", body: JSON.stringify({ disconnect: true }) });
-    window.location.href = disconnectUrl;
-  }
+	const checkPermissions = async () => {
+		setBusy(true);
+		setMessage(null);
+		try {
+			const result = await call<{ report: PermissionReport; settings: Settings }>("admin/permissions");
+			setSettings(result.settings);
+			setHealth(await call<KeyHealth>("admin/key-health"));
+			setMessage(
+				result.report.ok
+					? { tone: "ok", text: "The key has every permission that can be checked without side effects." }
+					: { tone: "error", text: "The key is missing permissions. See the results below." },
+			);
+		} catch (error) {
+			setMessage({ tone: "error", text: errorText(error) });
+		}
+		setBusy(false);
+	};
 
-  const save = async () => {
-    setSaving(true); setMsg("");
-    try {
-      await api("/admin/settings", {
-        method: "POST",
-        body: JSON.stringify({ showExcerpts: settings.showExcerpts, collectPassword: settings.collectPassword }),
-      });
-      const updated = await api("/admin/settings");
-      setSettings(updated);
-      setMsg("Settings saved.");
-    } catch { setMsg("Error saving."); }
-    setSaving(false);
-  };
+	const removeKey = async (confirmLocalOnly: boolean) => {
+		const prompt = confirmLocalOnly
+			? "Remove this Stripe key from this site only? The Connect authorization stays in place at Stripe."
+			: "Remove the Stripe key from this site?";
+		if (!window.confirm(prompt)) return;
+		setBusy(true);
+		try {
+			setSettings(await call<Settings>("admin/settings", { action: "remove-key", confirmLocalOnly }));
+			setHealth(null);
+			setMessage({ tone: "ok", text: "Stripe key removed." });
+		} catch (error) {
+			setMessage({ tone: "error", text: errorText(error) });
+		}
+		setBusy(false);
+	};
 
-  if (!settings) return <p>Loading...</p>;
+	if (!settings) {
+		return message ? <Notice tone="error">{message.text}</Notice> : <p>Loading…</p>;
+	}
 
-  return (
-    <div style={{ maxWidth: 640, padding: 16 }}>
-      <h2 style={{ fontSize: 20, fontWeight: 600, marginBottom: 16 }}>Restrict With Stripe</h2>
+	const envLabel = settings.environment === "sandbox" ? " (Sandbox)" : "";
+	const connectButtons = (
+		<>
+			<label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 14, margin: "8px 0 12px" }}>
+				<input type="checkbox" checked={sandbox} onChange={(event) => setSandbox(event.target.checked)} />
+				Connect a Stripe sandbox (test mode)
+			</label>
+			<button type="button" style={buttonStyle} disabled={busy || !settings.siteUrl} onClick={() => void startFlow("start-connect")}>
+				{settings.configured ? "Reconnect to Stripe" : "Connect to Stripe"}
+				{sandbox ? " (Sandbox)" : ""}
+			</button>
+		</>
+	);
 
-      <Section title={settings.isConfigured
-        ? `1. Connect to Stripe (Connected${settings.stripeEnvironment === "test" ? " in Test Mode" : ""})`
-        : "1. Connect to Stripe"}>
-        {settings.isConfigured ? (
-          <>
-            <p style={{ fontSize: 14, color: "#374151", marginBottom: 8 }}>
-              Connected to account: <strong>{settings.stripeAccountId || "—"}</strong>
-            </p>
-            <p style={{ fontSize: 13, color: "#6b7280", marginBottom: 12 }}>
-              <a href={`https://dashboard.stripe.com/${settings.stripeEnvironment === "test" ? "test/" : ""}dashboard`}
-                target="_blank" rel="noopener" style={{ color: "#635bff" }}>
-                Visit your Stripe account dashboard
-              </a>
-            </p>
-            <button onClick={disconnect} disabled={saving}
-              style={{ ...btnStyle, background: "#6b7280", fontSize: 13, padding: "6px 14px" }}>
-              Disconnect From Stripe
-            </button>
-          </>
-        ) : (
-          <>
-            <div style={{ marginBottom: 12 }}>
-              <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 14, cursor: "pointer" }}>
-                <input type="checkbox" checked={testMode} onChange={e => setTestMode(e.target.checked)} />
-                Connect in Test Mode
-              </label>
-            </div>
-            <a href={buildConnectUrl()} style={{
-              display: "inline-block", padding: "10px 20px", background: "#635bff", color: "white",
-              textDecoration: "none", borderRadius: 6, fontSize: 14, fontWeight: 500, marginBottom: 12,
-            }}>
-              Connect to Stripe{testMode ? " (Test Mode)" : ""}
-            </a>
-          </>
-        )}
-      </Section>
+	return (
+		<div style={{ maxWidth: 680, padding: 16 }}>
+			<h2 style={{ fontSize: 20, fontWeight: 600, marginBottom: 16 }}>Restrict With Stripe</h2>
+			{message && <Notice tone={message.tone}>{message.text}</Notice>}
+			{!settings.siteUrl && (
+				<Notice tone="warn">
+					The site URL is not configured, so Stripe Connect, checkout, and login links are disabled. Set
+					<code> siteUrl</code> in the emdash() integration, the <code>EMDASH_SITE_URL</code> environment variable,
+					or the Site URL under Settings &gt; General.
+				</Notice>
+			)}
+			{settings.encryptionError && (
+				<Notice tone="error">The stored Stripe key cannot be decrypted. Check EMDASH_ENCRYPTION_KEY.</Notice>
+			)}
+			{!settings.emailConfigured && (
+				<Notice tone="warn">
+					No email provider is configured, so members cannot request login links. Buyers are still logged in
+					automatically when they return from Stripe Checkout.
+				</Notice>
+			)}
 
-      <Section title="2. Create Products in Stripe">
-        <p style={{ fontSize: 14, color: "#6b7280" }}>
-          Create products and prices in your{" "}
-          <a href="https://dashboard.stripe.com/products" target="_blank" rel="noopener" style={{ color: "#635bff" }}>
-            Stripe Dashboard</a>. Each product needs at least one price.
-        </p>
-      </Section>
+			<Section title={`1. Connect to Stripe${settings.configured ? ` — connected${envLabel}` : ""}`}>
+				{settings.configured ? (
+					<>
+						<p style={{ fontSize: 14 }}>
+							{settings.keySource === "connect" ? "Connected through Stripe Connect" : "Using a manually entered key"}
+							{settings.accountId ? (
+								<>
+									{" "}to account <strong>{settings.accountId}</strong>
+								</>
+							) : null}
+							{settings.key ? ` (${settings.key.type} key ending ${settings.key.last4})` : ""}.
+						</p>
+						{health?.needsReconnect && (
+							<Notice tone="error">
+								Stripe no longer accepts this key. It may have been revoked or the account disconnected from the
+								Stripe dashboard. Reconnect to Stripe to restore checkout and access checks.
+							</Notice>
+						)}
+						{health?.needsNewKey && (
+							<Notice tone="error">
+								Stripe no longer accepts this {health.keyType === "restricted" ? "restricted" : "secret"} key. It may have been
+								revoked, rolled, or deleted in the Stripe dashboard.{" "}
+								<button type="button" style={linkButton} onClick={() => setManualOpen(true)}>
+									{health.keyType === "restricted" ? "Update your restricted key" : "Update your key"}
+								</button>
+							</Notice>
+						)}
+						{settings.permissionError && <Notice tone="error">{settings.permissionError.message}</Notice>}
+						{settings.key?.type === "restricted" && (
+							<div style={{ marginTop: 12 }}>
+								<button type="button" style={secondaryButton} disabled={busy} onClick={() => void checkPermissions()}>
+									Check key permissions
+								</button>
+								{settings.permissionReport && <PermissionResults report={settings.permissionReport} />}
+							</div>
+						)}
+						{health?.error && <Notice tone="warn">Could not reach Stripe to check the key.</Notice>}
+						{health?.needsReconnect && connectButtons}
+						<div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginTop: 12 }}>
+							{settings.keySource === "connect" && (
+								<button type="button" style={secondaryButton} disabled={busy || !settings.siteUrl} onClick={() => void startFlow("start-disconnect")}>
+									Disconnect From Stripe
+								</button>
+							)}
+							{(settings.keySource !== "connect" || health?.needsReconnect) && (
+								<button type="button" style={secondaryButton} disabled={busy} onClick={() => void removeKey(settings.keySource === "connect")}>
+									Remove key from this site
+								</button>
+							)}
+						</div>
+						<p style={{ ...muted, marginTop: 12 }}>
+							<a
+								href={`https://dashboard.stripe.com/${settings.environment === "sandbox" ? "test/" : ""}dashboard`}
+								target="_blank"
+								rel="noopener noreferrer"
+								style={{ color: "#635bff" }}
+							>
+								Open your Stripe dashboard
+							</a>
+						</p>
+					</>
+				) : (
+					connectButtons
+				)}
+				<details
+					style={{ marginTop: 16 }}
+					open={manualOpen}
+					onToggle={(event) => setManualOpen((event.currentTarget as HTMLDetailsElement).open)}
+				>
+					<summary style={{ cursor: "pointer", fontSize: 14 }}>
+						{settings.key?.type === "restricted" ? "Update your restricted key" : "Use your own Stripe key instead of Connect"}
+					</summary>
+					<p style={{ fontSize: 14, margin: "8px 0" }}>
+						We recommend a restricted key (rk_…). In your{" "}
+						<a
+							href={`https://dashboard.stripe.com/${settings.environment === "sandbox" ? "test/" : ""}apikeys`}
+							target="_blank"
+							rel="noopener noreferrer"
+							style={{ color: "#635bff" }}
+						>
+							Stripe API keys page
+						</a>
+						, click <strong>Create restricted key</strong>, leave every resource at <strong>None</strong> except:
+					</p>
+					<PermissionChecklist />
+					<p style={{ ...muted, margin: "8px 0" }}>
+						Write includes Read. A full secret key (sk_…) also works. There is no platform fee either way. The key is
+						encrypted with EMDASH_ENCRYPTION_KEY and is never shown again. Saving a restricted key checks its
+						permissions right away.
+					</p>
+					<input
+						type="password"
+						autoComplete="off"
+						value={manualKey}
+						onChange={(event) => setManualKey(event.target.value)}
+						placeholder="rk_live_…"
+						style={{ width: "100%", padding: "6px 10px", marginBottom: 8, font: "inherit" }}
+					/>
+					<button type="button" style={buttonStyle} disabled={busy || !manualKey.trim()} onClick={() => void save({ secretKey: manualKey.trim() }, "Stripe key saved.")}>
+						Save key
+					</button>
+				</details>
+			</Section>
 
-      <Section title="3. Restrict Content">
-        <p style={{ fontSize: 14, color: "#6b7280" }}>
-          Edit any post or page and click the <strong>Restrict</strong> button in the toolbar
-          to choose which Stripe products are required for access.
-        </p>
-      </Section>
+			<Section title="2. Create products in Stripe">
+				<p style={{ fontSize: 14 }}>
+					Create products with a default price in your{" "}
+					<a href="https://dashboard.stripe.com/products" target="_blank" rel="noopener noreferrer" style={{ color: "#635bff" }}>
+						Stripe dashboard
+					</a>
+					. One-time and recurring prices both work.
+				</p>
+			</Section>
 
-      <Section title="4. Display Settings">
-        <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 14, marginBottom: 8 }}>
-          <input type="checkbox" checked={settings.showExcerpts}
-            onChange={e => setSettings({ ...settings, showExcerpts: e.target.checked })} />
-          Show excerpts on restricted content
-        </label>
-        <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 14 }}>
-          <input type="checkbox" checked={settings.collectPassword}
-            onChange={e => setSettings({ ...settings, collectPassword: e.target.checked })} />
-          Collect password at registration
-        </label>
-        <button onClick={save} disabled={saving} style={{ ...btnStyle, marginTop: 12 }}>
-          {saving ? "Saving..." : "Save Settings"}
-        </button>
-        {msg && <p style={{ marginTop: 8, fontSize: 14, color: msg.includes("Error") ? "#dc2626" : "#059669" }}>{msg}</p>}
-      </Section>
-    </div>
-  );
+			<Section title="3. Restrict content">
+				<p style={{ fontSize: 14 }}>
+					Open any saved post or page and use the <strong>Restrict With Stripe</strong> panel in the editor sidebar to
+					choose which products grant access.
+				</p>
+			</Section>
+
+			<Section title="4. Display">
+				<label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 14 }}>
+					<input
+						type="checkbox"
+						checked={settings.showExcerpts}
+						disabled={busy}
+						onChange={(event) => void save({ showExcerpts: event.target.checked }, "Display settings saved.")}
+					/>
+					Show the first paragraph of restricted content above the paywall
+				</label>
+				<p style={{ ...muted, marginTop: 8 }}>
+					The paywall is rendered by the browser. Restricted text is still present in the page HTML unless your theme
+					gates it on the server; see the plugin README.
+				</p>
+			</Section>
+		</div>
+	);
 }
 
-// ═══════════════════════════════════════════════════════════════════
-// Restrictions Page
-// ═══════════════════════════════════════════════════════════════════
+// ─── Restrictions page ───────────────────────────────────────────
+
+function useProducts(enabled: boolean) {
+	const [products, setProducts] = React.useState<Product[]>([]);
+	const [error, setError] = React.useState<string | null>(null);
+	React.useEffect(() => {
+		if (!enabled) return;
+		call<{ products: Product[] }>("admin/products")
+			.then((data) => setProducts(data.products))
+			.catch((cause) => setError(errorText(cause)));
+	}, [enabled]);
+	return { products, error };
+}
+
 function RestrictionsPage() {
-  const [restrictions, setRestrictions] = useState<any[]>([]);
-  const [products, setProducts] = useState<any[]>([]);
-  const [loading, setLoading] = useState(true);
+	const [items, setItems] = React.useState<RestrictionItem[] | null>(null);
+	const [error, setError] = React.useState<string | null>(null);
+	const { products } = useProducts(true);
 
-  const load = useCallback(async () => {
-    setLoading(true);
-    const [r, p] = await Promise.all([
-      api("/admin/restrictions"),
-      api("/admin/products").catch(() => ({ products: [] })),
-    ]);
-    setRestrictions(r.items || []);
-    setProducts(p.products || []);
-    setLoading(false);
-  }, []);
+	const load = React.useCallback(() => {
+		call<{ items: RestrictionItem[] }>("admin/restrictions", { action: "list" })
+			.then((data) => setItems(data.items))
+			.catch((cause) => setError(errorText(cause)));
+	}, []);
+	React.useEffect(load, [load]);
 
-  useEffect(() => { load(); }, [load]);
+	const remove = async (item: RestrictionItem) => {
+		if (!window.confirm(`Remove the restriction from ${item.title ?? item.contentId}?`)) return;
+		try {
+			await call("admin/restrictions", { action: "delete", collection: item.collectionSlug, id: item.contentId });
+			load();
+		} catch (cause) {
+			setError(errorText(cause));
+		}
+	};
 
-  const remove = async (item: any) => {
-    const d = item.data || item;
-    await api("/admin/restrictions", {
-      method: "DELETE",
-      body: JSON.stringify({ contentId: d.contentId, collectionSlug: d.collectionSlug }),
-    });
-    load();
-  };
+	const productName = (id: string) => products.find((product) => product.id === id)?.name ?? id;
 
-  if (loading) return <p>Loading...</p>;
-
-  return (
-    <div style={{ maxWidth: 720, padding: 16 }}>
-      <h2 style={{ fontSize: 20, fontWeight: 600, marginBottom: 16 }}>Restricted Content</h2>
-
-      {restrictions.length === 0 ? (
-        <p style={{ color: "#6b7280", fontSize: 14 }}>
-          No content restricted yet. Edit a post or page and click "Restrict" in the toolbar.
-        </p>
-      ) : (
-        <div style={{ border: "1px solid #e5e7eb", borderRadius: 8, overflow: "hidden" }}>
-          {restrictions.map((item, i) => {
-            const d = item.data || item;
-            return (
-              <div key={item.id || i} style={{
-                padding: 12, borderBottom: i < restrictions.length - 1 ? "1px solid #e5e7eb" : "none",
-                display: "flex", justifyContent: "space-between", alignItems: "center",
-              }}>
-                <div>
-                  <div style={{ fontWeight: 500, fontSize: 14 }}>{d.collectionSlug}/{d.contentId}</div>
-                  <div style={{ fontSize: 12, color: "#6b7280" }}>
-                    Products: {(d.productIds || []).map((id: string) => {
-                      const prod = products.find((p: any) => p.id === id);
-                      return prod ? prod.name : id.slice(0, 12) + "...";
-                    }).join(", ") || "none"}
-                  </div>
-                </div>
-                <button onClick={() => remove(item)}
-                  style={{ fontSize: 12, color: "#dc2626", background: "none", border: "none", cursor: "pointer" }}>
-                  Remove
-                </button>
-              </div>
-            );
-          })}
-        </div>
-      )}
-    </div>
-  );
+	return (
+		<div style={{ maxWidth: 760, padding: 16 }}>
+			<h2 style={{ fontSize: 20, fontWeight: 600, marginBottom: 16 }}>Restricted Content</h2>
+			{error && <Notice tone="error">{error}</Notice>}
+			{!items ? (
+				<p>Loading…</p>
+			) : items.length === 0 ? (
+				<p style={{ fontSize: 14 }}>Nothing is restricted yet. Use the Restrict With Stripe panel when editing an entry.</p>
+			) : (
+				<ul style={{ listStyle: "none", padding: 0, margin: 0 }}>
+					{items.map((item) => (
+						<li
+							key={`${item.collectionSlug}:${item.contentId}`}
+							style={{ padding: "10px 0", borderBottom: "1px solid rgba(127,127,127,0.25)", display: "flex", justifyContent: "space-between", gap: 12 }}
+						>
+							<div>
+								<a
+									href={`/_emdash/admin/content/${encodeURIComponent(item.collectionSlug)}/${encodeURIComponent(item.contentId)}`}
+									style={{ fontWeight: 500, fontSize: 14, color: "inherit" }}
+								>
+									{item.title ?? item.slug ?? item.contentId}
+								</a>
+								<div style={muted}>
+									{item.collectionSlug} · {item.productIds.map(productName).join(", ")}
+								</div>
+							</div>
+							<button type="button" style={{ ...linkButton, color: "#dc2626", fontSize: 13 }} onClick={() => void remove(item)}>
+								Remove
+							</button>
+						</li>
+					))}
+				</ul>
+			)}
+		</div>
+	);
 }
 
-// ═══════════════════════════════════════════════════════════════════
-// Dashboard Widget
-// ═══════════════════════════════════════════════════════════════════
+// ─── Dashboard widget ────────────────────────────────────────────
+
 function OverviewWidget() {
-  const [data, setData] = useState<any>(null);
-  useEffect(() => {
-    Promise.all([api("/admin/settings"), api("/admin/restrictions")])
-      .then(([s, r]) => setData({ connected: s.isConfigured, env: s.stripeEnvironment, count: (r.items || []).length }))
-      .catch(() => setData({ connected: false, count: 0 }));
-  }, []);
-  if (!data) return <p style={{ fontSize: 13 }}>Loading...</p>;
-  return (
-    <div style={{ fontSize: 14 }}>
-      <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 6 }}>
-        <span style={{ color: "#6b7280" }}>Stripe</span>
-        <span style={{ fontWeight: 500, color: data.connected ? "#059669" : "#dc2626" }}>
-          {data.connected ? `Connected (${data.env})` : "Not connected"}
-        </span>
-      </div>
-      <div style={{ display: "flex", justifyContent: "space-between" }}>
-        <span style={{ color: "#6b7280" }}>Restricted items</span>
-        <span style={{ fontWeight: 500 }}>{data.count}</span>
-      </div>
-    </div>
-  );
+	const [data, setData] = React.useState<{ settings: Settings; count: number } | null>(null);
+	const [failed, setFailed] = React.useState(false);
+	React.useEffect(() => {
+		Promise.all([
+			call<Settings>("admin/settings", { action: "get" }),
+			call<{ items: RestrictionItem[] }>("admin/restrictions", { action: "list" }),
+		])
+			.then(([settings, restrictions]) => setData({ settings, count: restrictions.items.length }))
+			.catch(() => setFailed(true));
+	}, []);
+	if (failed) return <p style={muted}>Unavailable</p>;
+	if (!data) return <p style={muted}>Loading…</p>;
+	const { settings, count } = data;
+	return (
+		<div style={{ fontSize: 14, display: "grid", gap: 6 }}>
+			<div style={{ display: "flex", justifyContent: "space-between" }}>
+				<span style={muted}>Stripe</span>
+				<span style={{ fontWeight: 500, color: settings.configured ? "#059669" : "#dc2626" }}>
+					{settings.configured ? `Connected${settings.environment === "sandbox" ? " (sandbox)" : ""}` : "Not connected"}
+				</span>
+			</div>
+			<div style={{ display: "flex", justifyContent: "space-between" }}>
+				<span style={muted}>Restricted entries</span>
+				<span style={{ fontWeight: 500 }}>{count}</span>
+			</div>
+		</div>
+	);
 }
 
-// ═══════════════════════════════════════════════════════════════════
-// Sidebar Panel — Injects toolbar button + restriction modal
-// The panel renders minimal in the sidebar, but also injects a
-// "Restrict" button next to Preview in the editor toolbar.
-// ═══════════════════════════════════════════════════════════════════
-function RestrictionPanel({ collection, entryId, item }: {
-  collection: string; entryId?: string; item?: Record<string, unknown>;
-}) {
-  const [products, setProducts] = useState<any[]>([]);
-  const [selectedIds, setSelectedIds] = useState<string[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [configured, setConfigured] = useState<boolean | null>(null);
-  const [modalOpen, setModalOpen] = useState(false);
-  const [saving, setSaving] = useState(false);
-  const [error, setError] = useState("");
-  const toolbarBtnRef = useRef<HTMLElement | null>(null);
-  const portalContainer = useRef<HTMLDivElement | null>(null);
+// ─── Editor panel ────────────────────────────────────────────────
 
-  // Use slug for restriction keys (matches frontend URL-based lookups)
-  // item.slug is the URL slug; entryId is the database ULID
-  const slug = (item as any)?.slug || (item as any)?.data?.slug || entryId;
-
-  // Load data
-  useEffect(() => {
-    if (!slug) { setLoading(false); return; }
-    api("/admin/settings").then(settings => {
-      setConfigured(settings.isConfigured);
-      if (!settings.isConfigured) { setLoading(false); return; }
-      return Promise.all([
-        api("/admin/products").catch(() => ({ products: [] })),
-        api(`/admin/restrictions?collection=${collection}`).catch(() => ({ items: [] })),
-      ]).then(([prodData, resData]) => {
-        setProducts(prodData.products || []);
-        const items = resData.items || [];
-        const match = items.find((r: any) => (r.data?.contentId || r.contentId) === slug);
-        if (match) setSelectedIds(match.data?.productIds || match.productIds || []);
-        setLoading(false);
-      });
-    }).catch(() => { setConfigured(false); setLoading(false); });
-  }, [slug, collection]);
-
-  // Inject toolbar button next to Preview
-  useEffect(() => {
-    if (loading) return;
-
-    // Create portal container for the modal
-    if (!portalContainer.current) {
-      portalContainer.current = document.createElement("div");
-      document.body.appendChild(portalContainer.current);
-    }
-
-    // Find the toolbar buttons area (the flex container with Preview/Save/Publish)
-    const findAndInject = () => {
-      // Look for the Preview or Save button area
-      const buttons = document.querySelectorAll('button');
-      let targetContainer: Element | null = null;
-      let insertBefore: Element | null = null;
-
-      for (const btn of buttons) {
-        const text = btn.textContent?.trim() || "";
-        if (text === "Preview" || text === "Preview draft") {
-          targetContainer = btn.parentElement;
-          insertBefore = btn;
-          break;
-        }
-      }
-
-      // Fallback: look for Save button
-      if (!targetContainer) {
-        for (const btn of buttons) {
-          if (btn.textContent?.trim() === "Save") {
-            targetContainer = btn.parentElement;
-            insertBefore = btn;
-            break;
-          }
-        }
-      }
-
-      if (!targetContainer || toolbarBtnRef.current?.parentElement === targetContainer) return;
-
-      // Create the Restrict button
-      const restrictBtn = document.createElement("button");
-      restrictBtn.type = "button";
-      restrictBtn.className = (insertBefore as HTMLElement)?.className || "";
-      restrictBtn.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 256 256" fill="currentColor" style="margin-right:4px"><path d="M208,80H176V56a48,48,0,0,0-96,0V80H48A16,16,0,0,0,32,96V208a16,16,0,0,0,16,16H208a16,16,0,0,0,16-16V96A16,16,0,0,0,208,80ZM96,56a32,32,0,0,1,64,0V80H96ZM208,208H48V96H208V208Zm-80-36a12,12,0,1,1,12-12A12,12,0,0,1,128,172Zm20-52a4,4,0,0,1-4,4H112a4,4,0,0,1,0-8h32A4,4,0,0,1,148,120Z"/></svg>`;
-      restrictBtn.innerHTML += selectedIds.length > 0 ? "Restricted" : "Restrict";
-
-      if (selectedIds.length > 0) {
-        restrictBtn.style.color = "#635bff";
-        restrictBtn.style.borderColor = "#635bff";
-      }
-
-      restrictBtn.addEventListener("click", () => setModalOpen(true));
-
-      if (toolbarBtnRef.current) toolbarBtnRef.current.remove();
-      targetContainer.insertBefore(restrictBtn, insertBefore);
-      toolbarBtnRef.current = restrictBtn;
-    };
-
-    // Try immediately, then with MutationObserver for SPA navigation
-    findAndInject();
-    const observer = new MutationObserver(findAndInject);
-    observer.observe(document.body, { childList: true, subtree: true });
-
-    return () => {
-      observer.disconnect();
-      if (toolbarBtnRef.current) toolbarBtnRef.current.remove();
-    };
-  }, [loading, selectedIds, entryId]);
-
-  // Update button text when selection changes
-  useEffect(() => {
-    if (toolbarBtnRef.current) {
-      const hasRestrictions = selectedIds.length > 0;
-      toolbarBtnRef.current.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 256 256" fill="currentColor" style="margin-right:4px"><path d="M208,80H176V56a48,48,0,0,0-96,0V80H48A16,16,0,0,0,32,96V208a16,16,0,0,0,16,16H208a16,16,0,0,0,16-16V96A16,16,0,0,0,208,80ZM96,56a32,32,0,0,1,64,0V80H96ZM208,208H48V96H208V208Zm-80-36a12,12,0,1,1,12-12A12,12,0,0,1,128,172Zm20-52a4,4,0,0,1-4,4H112a4,4,0,0,1,0-8h32A4,4,0,0,1,148,120Z"/></svg>`;
-      toolbarBtnRef.current.innerHTML += hasRestrictions ? "Restricted" : "Restrict";
-      toolbarBtnRef.current.style.color = hasRestrictions ? "#635bff" : "";
-      toolbarBtnRef.current.style.borderColor = hasRestrictions ? "#635bff" : "";
-    }
-  }, [selectedIds]);
-
-  const apply = async (newIds: string[]) => {
-    if (!slug) return;
-    setSaving(true);
-    if (newIds.length === 0) {
-      await api("/admin/restrictions", {
-        method: "DELETE",
-        body: JSON.stringify({ contentId: slug, collectionSlug: collection }),
-      });
-    } else {
-      await api("/admin/restrictions", {
-        method: "POST",
-        body: JSON.stringify({ contentId: slug, collectionSlug: collection, productIds: newIds }),
-      });
-    }
-    setSelectedIds(newIds);
-    setSaving(false);
-    setModalOpen(false);
-  };
-
-  // Render the modal via portal (outside sidebar)
-  const modal = modalOpen && portalContainer.current ? createPortal(
-    <RestrictionModal
-      products={products}
-      selectedIds={selectedIds}
-      configured={configured}
-      error={error}
-      saving={saving}
-      onApply={apply}
-      onClose={() => setModalOpen(false)}
-    />,
-    portalContainer.current,
-  ) : null;
-
-  // Sidebar shows minimal status
-  if (!entryId) return <p style={{ fontSize: 13, color: "#6b7280" }}>Save first.</p>;
-  if (loading) return <p style={{ fontSize: 13, color: "#6b7280" }}>Loading...</p>;
-
-  return (
-    <div>
-      {selectedIds.length > 0 ? (
-        <p style={{ fontSize: 13, color: "#635bff", fontWeight: 500 }}>
-          {selectedIds.length} product{selectedIds.length > 1 ? "s" : ""} required
-        </p>
-      ) : (
-        <p style={{ fontSize: 13, color: "#6b7280" }}>Not restricted</p>
-      )}
-      <button onClick={() => setModalOpen(true)}
-        style={{ fontSize: 13, color: "#635bff", background: "none", border: "none", cursor: "pointer", padding: 0, textDecoration: "underline" }}>
-        {selectedIds.length > 0 ? "Edit restrictions" : "Add restriction"}
-      </button>
-      {modal}
-    </div>
-  );
+interface PanelProps {
+	entry: { id: string; slug?: string | null };
+	collection: string;
+	locale?: string;
 }
 
-// ═══════════════════════════════════════════════════════════════════
-// Restriction Modal
-// ═══════════════════════════════════════════════════════════════════
-function RestrictionModal({ products, selectedIds, configured, error, saving, onApply, onClose }: {
-  products: any[];
-  selectedIds: string[];
-  configured: boolean | null;
-  error: string;
-  saving: boolean;
-  onApply: (ids: string[]) => void;
-  onClose: () => void;
-}) {
-  const [localIds, setLocalIds] = useState<string[]>(selectedIds);
+function RestrictionPanel({ entry, collection }: PanelProps) {
+	const [configured, setConfigured] = React.useState<boolean | null>(null);
+	const [selected, setSelected] = React.useState<string[]>([]);
+	const [saved, setSaved] = React.useState<string[]>([]);
+	const [status, setStatus] = React.useState<{ tone: "ok" | "error"; text: string } | null>(null);
+	const [busy, setBusy] = React.useState(false);
+	const { products, error: productError } = useProducts(configured === true);
 
-  const toggle = (productId: string, checked: boolean) => {
-    setLocalIds(checked ? [...localIds, productId] : localIds.filter(id => id !== productId));
-  };
+	React.useEffect(() => {
+		let cancelled = false;
+		call<Settings>("admin/settings", { action: "get" })
+			.then(async (settings) => {
+				if (cancelled) return;
+				setConfigured(settings.configured);
+				const restriction = await call<{ productIds: string[] }>("admin/restrictions", {
+					action: "get",
+					collection,
+					id: entry.id,
+				});
+				if (cancelled) return;
+				setSelected(restriction.productIds);
+				setSaved(restriction.productIds);
+			})
+			.catch((cause) => setStatus({ tone: "error", text: errorText(cause) }));
+		return () => {
+			cancelled = true;
+		};
+	}, [collection, entry.id]);
 
-  return (
-    <div style={{
-      position: "fixed", inset: 0, zIndex: 9999,
-      display: "flex", alignItems: "center", justifyContent: "center",
-    }}>
-      {/* Backdrop */}
-      <div onClick={onClose} style={{
-        position: "absolute", inset: 0, background: "rgba(0,0,0,0.4)",
-      }} />
+	const toggle = (id: string, checked: boolean) => {
+		setStatus(null);
+		setSelected((current) => (checked ? [...new Set([...current, id])] : current.filter((value) => value !== id)));
+	};
 
-      {/* Dialog */}
-      <div style={{
-        position: "relative", background: "white", borderRadius: 12,
-        padding: 24, minWidth: 360, maxWidth: 480, maxHeight: "80vh", overflowY: "auto",
-        boxShadow: "0 20px 60px rgba(0,0,0,0.3)",
-      }}>
-        <h2 style={{ fontSize: 18, fontWeight: 600, marginBottom: 16 }}>Restrict With Stripe</h2>
+	const save = async () => {
+		setBusy(true);
+		try {
+			const result = await call<{ productIds: string[] }>("admin/restrictions", {
+				action: "set",
+				collection,
+				id: entry.id,
+				productIds: selected,
+			});
+			setSaved(result.productIds);
+			setSelected(result.productIds);
+			setStatus({ tone: "ok", text: result.productIds.length ? "Restriction saved." : "Restriction removed." });
+		} catch (cause) {
+			setStatus({ tone: "error", text: errorText(cause) });
+		}
+		setBusy(false);
+	};
 
-        {configured === false ? (
-          <p style={{ color: "#6b7280" }}>Connect Stripe in RWStripe Settings first.</p>
-        ) : error ? (
-          <p style={{ color: "#dc2626" }}>{error}</p>
-        ) : products.length === 0 ? (
-          <p style={{ color: "#6b7280" }}>No products found. Create products in Stripe first.</p>
-        ) : (
-          <>
-            <p style={{ fontSize: 14, color: "#6b7280", marginBottom: 12 }}>
-              Select which Stripe products are required to view this content:
-            </p>
-            <div style={{ marginBottom: 16 }}>
-              {products.map((p: any) => (
-                <label key={p.id} style={{
-                  display: "flex", alignItems: "center", gap: 8, fontSize: 14,
-                  padding: "8px 0", borderBottom: "1px solid #f3f4f6", cursor: "pointer",
-                }}>
-                  <input type="checkbox" checked={localIds.includes(p.id)}
-                    onChange={e => toggle(p.id, e.target.checked)} />
-                  <div>
-                    <div style={{ fontWeight: 500 }}>{p.name}</div>
-                    {p.description && <div style={{ fontSize: 12, color: "#9ca3af" }}>{p.description}</div>}
-                  </div>
-                </label>
-              ))}
-            </div>
-          </>
-        )}
+	if (configured === null) return <p style={muted}>{status ? status.text : "Loading…"}</p>;
+	if (!configured) {
+		return (
+			<p style={muted}>
+				Connect Stripe on the{" "}
+				<a href="/_emdash/admin/plugins/restrict-with-stripe/settings" style={{ color: "#635bff" }}>
+					Restrict With Stripe settings
+				</a>{" "}
+				page first.
+			</p>
+		);
+	}
 
-        <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, marginTop: 8 }}>
-          <button onClick={onClose} style={{ ...btnStyle, background: "#e5e7eb", color: "#374151" }}>Cancel</button>
-          {configured !== false && products.length > 0 && (
-            <button onClick={() => onApply(localIds)} disabled={saving}
-              style={{ ...btnStyle, opacity: saving ? 0.6 : 1 }}>
-              {saving ? "Saving..." : "Apply"}
-            </button>
-          )}
-        </div>
-      </div>
-    </div>
-  );
+	const dirty = selected.slice().sort().join(",") !== saved.slice().sort().join(",");
+	// Products that are restricting this entry but are no longer active in Stripe.
+	const missing = selected.filter((id) => !products.some((product) => product.id === id));
+
+	return (
+		<div style={{ fontSize: 14 }}>
+			<p style={{ ...muted, marginBottom: 8 }}>
+				{saved.length ? "Visitors need one of the checked products to view this entry." : "Not restricted. Check a product to require it."}
+			</p>
+			{productError && <Notice tone="error">{productError}</Notice>}
+			{products.length === 0 && !productError && <p style={muted}>No active products found in Stripe.</p>}
+			{[...products.map((product) => ({ id: product.id, label: product.name, detail: product.price })), ...missing.map((id) => ({ id, label: id, detail: "inactive or missing" }))].map(
+				(option) => (
+					<label key={option.id} style={{ display: "flex", gap: 8, alignItems: "flex-start", padding: "4px 0", cursor: "pointer" }}>
+						<input type="checkbox" checked={selected.includes(option.id)} onChange={(event) => toggle(option.id, event.target.checked)} />
+						<span>
+							{option.label}
+							{option.detail && <span style={{ ...muted, display: "block" }}>{option.detail}</span>}
+						</span>
+					</label>
+				),
+			)}
+			<button type="button" style={{ ...buttonStyle, marginTop: 8 }} disabled={busy || !dirty} onClick={() => void save()}>
+				{busy ? "Saving…" : "Save restriction"}
+			</button>
+			{status && <Notice tone={status.tone}>{status.text}</Notice>}
+		</div>
+	);
 }
 
-// ═══════════════════════════════════════════════════════════════════
-// Exports
-// ═══════════════════════════════════════════════════════════════════
+// ─── Exports ─────────────────────────────────────────────────────
+
 export const pages = {
-  "/settings": SettingsPage,
-  "/restrictions": RestrictionsPage,
+	"/settings": SettingsPage,
+	"/restrictions": RestrictionsPage,
 };
 
 export const widgets = {
-  overview: OverviewWidget,
+	overview: OverviewWidget,
 };
 
-// Toolbar button + modal handles restriction UI — no sidebar panel needed
-
-// ═══════════════════════════════════════════════════════════════════
-// Shared UI
-// ═══════════════════════════════════════════════════════════════════
-function Section({ title, children }: { title: string; children: React.ReactNode }) {
-  return (
-    <div style={{ marginBottom: 24 }}>
-      <h3 style={{ fontSize: 15, fontWeight: 600, marginBottom: 8 }}>{title}</h3>
-      {children}
-    </div>
-  );
-}
-
-const btnStyle: React.CSSProperties = {
-  padding: "8px 16px", background: "#635bff", color: "white",
-  border: "none", borderRadius: 6, cursor: "pointer", fontSize: 14, fontWeight: 500,
-};
+export const contentEditorPanels = [
+	{
+		id: "restrict-with-stripe",
+		title: "Restrict With Stripe",
+		component: RestrictionPanel,
+		// The restriction routes require plugins:manage, which EmDash grants to administrators.
+		minRole: 50,
+		order: 50,
+	},
+];

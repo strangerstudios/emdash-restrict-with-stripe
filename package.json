@@ -1,15 +1,48 @@
 {
   "name": "emdash-restrict-with-stripe",
-  "version": "0.1.0",
+  "version": "0.2.0",
+  "description": "Restrict EmDash content to Stripe customers. Native EmDash 1.x plugin with Stripe Checkout, magic-link member sessions, and Stripe Connect.",
   "type": "module",
-  "main": "src/index.ts",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
   "exports": {
-    ".": "./src/index.ts",
-    "./plugin": "./src/plugin.ts",
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./astro": {
+      "types": "./dist/astro.d.ts",
+      "import": "./dist/astro.js"
+    },
     "./admin": "./src/admin.tsx"
   },
+  "files": [
+    "dist",
+    "src",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "vitest run",
+    "prepare": "npm run build"
+  },
   "peerDependencies": {
-    "emdash": ">=0.1.0",
-    "react": ">=19.0.0"
-  }
+    "emdash": ">=1.0.0",
+    "react": ">=18.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.5",
+    "@types/react": "^19.3.0",
+    "emdash": "^1.3.0",
+    "typescript": "~5.9.3",
+    "vitest": "^3.2.7"
+  },
+  "keywords": [
+    "emdash",
+    "emdash-plugin",
+    "stripe",
+    "paywall"
+  ],
+  "license": "GPL-2.0-or-later"
 }

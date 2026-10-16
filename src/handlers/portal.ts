@@ -1,22 +1,34 @@
-// GET customer_portal_url — authenticated, returns Stripe Customer Portal URL
-import { StripeClient } from "../stripe.js";
+// POST portal {session, return_path}: Stripe billing portal URL for the session's customer.
 
-export async function portalHandler(ctx: any) {
-  const userId = ctx.user?.id;
-  if (!userId) return { error: "Not authenticated" };
+import { PORTAL_CONFIG_KEY, requireStripe } from "../lib/config.js";
+import { fail, type RCtx, requireSiteOrigin } from "../lib/context.js";
+import { getSession } from "../lib/sessions.js";
+import { validateReturnPath } from "../lib/validate.js";
+import { body, stripeCall } from "./util.js";
 
-  const secretKey = await ctx.kv.get("stripe_secret_key");
-  if (!secretKey) return { error: "Stripe not configured" };
+export async function portalHandler(ctx: RCtx): Promise<{ url: string }> {
+	const input = body(ctx);
+	const siteOrigin = requireSiteOrigin(ctx);
+	const returnPath = validateReturnPath(input.return_path, siteOrigin);
+	if (!returnPath) fail("INVALID_RETURN_PATH", "return_path must be a path on this site.");
+	const identity = await getSession(ctx, input.session);
+	if (!identity) fail("NOT_LOGGED_IN", "Log in to manage your purchases.", 401);
 
-  const customer = await ctx.storage.customers.get(userId);
-  if (!customer) return { error: "No customer found for this user." };
+	const { config, stripe } = await requireStripe(ctx);
+	const customers = await stripeCall(ctx, "customer lookup", () => stripe.customersFor(identity));
+	const customerId = customers[0];
+	if (!customerId) fail("NO_CUSTOMER", "No purchases were found for this email.", 404);
 
-  const customerId = customer.data?.stripeCustomerId || customer.stripeCustomerId;
-  const url = new URL(ctx.request.url);
-  const returnUrl = url.searchParams.get("return_url") || "/";
-
-  const stripe = new StripeClient(secretKey, ctx.http.fetch);
-  const session = await stripe.createPortalSession(customerId, returnUrl);
-
-  return { url: session.url };
+	// Cached per key so a different Stripe account never reuses another's configuration.
+	const cached = await ctx.kv.get<{ keyHash: string; id: string }>(PORTAL_CONFIG_KEY);
+	let configuration = cached?.keyHash === config.keyHash ? cached.id : null;
+	if (!configuration) {
+		configuration = await stripeCall(ctx, "portal configuration", () => stripe.ensurePortalConfiguration());
+		await ctx.kv.set(PORTAL_CONFIG_KEY, { keyHash: config.keyHash, id: configuration });
+	}
+	const configurationId = configuration;
+	const portal = await stripeCall(ctx, "portal session", () =>
+		stripe.createPortalSession(customerId, `${siteOrigin}${returnPath}`, configurationId),
+	);
+	return { url: portal.url };
 }

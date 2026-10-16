@@ -1,11 +1,19 @@
-// GET products — admin only, returns all active Stripe products
-import { StripeClient } from "../stripe.js";
+// GET|POST products: products that restrict at least one entry, for the paywall picker.
 
-export async function productsHandler(ctx: any) {
-  const secretKey = await ctx.kv.get("stripe_secret_key");
-  if (!secretKey) return { error: "Stripe not configured" };
+import { requireStripe } from "../lib/config.js";
+import type { RCtx } from "../lib/context.js";
+import { getActiveProducts, type ProductSummary } from "../lib/products.js";
+import { referencedProductIds } from "../lib/restrictions.js";
+import { stripeCall } from "./util.js";
 
-  const stripe = new StripeClient(secretKey, ctx.http.fetch);
-  const products = await stripe.getAllProducts();
-  return { products: products.data };
+export async function productsHandler(ctx: RCtx): Promise<{ products: ProductSummary[] }> {
+	const { config, stripe } = await requireStripe(ctx);
+	const referenced = await referencedProductIds(ctx);
+	if (referenced.size === 0) return { products: [] };
+	const products = await stripeCall(ctx, "product listing", () => getActiveProducts(ctx, stripe, config.keyHash));
+	return {
+		products: products
+			.filter((product) => referenced.has(product.id) && product.priceId)
+			.map(({ id, name, description, priceId, price }) => ({ id, name, description, priceId, price })),
+	};
 }

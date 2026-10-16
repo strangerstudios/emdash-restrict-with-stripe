@@ -1,50 +1,22 @@
-// ─── Plugin Descriptor (for astro.config.mjs) ──────────────────
-// Metadata only. emdash imports the entrypoint separately for hooks/routes.
+// Descriptor factory for astro.config.mjs, plus the named createPlugin() export that
+// EmDash's native loader imports from the same entrypoint.
 
-export function restrictWithStripe() {
-  return {
-    id: "restrict-with-stripe",
-    version: "0.1.0",
-    entrypoint: "emdash-restrict-with-stripe/plugin",
-    adminEntry: "emdash-restrict-with-stripe/admin",
-    options: {},
-    capabilities: [
-      "read:content",
-      "read:users",
-      "network:fetch",
-      "page:inject",
-    ],
-    allowedHosts: ["api.stripe.com"],
+import type { PluginDescriptor } from "emdash";
 
-    storage: {
-      // Content restrictions: which Stripe product IDs restrict which content
-      restrictions: {
-        indexes: ["contentId", "collectionSlug"],
-      },
-      // Taxonomy restrictions: which product IDs restrict which taxonomy terms
-      taxonomyRestrictions: {
-        indexes: ["taxonomyName", "termId"],
-      },
-      // User → Stripe customer mapping
-      customers: {
-        indexes: ["email"],
-      },
-      authTokens: {
-        indexes: ["email", "expiresAt"],
-      },
-      sessions: {
-        indexes: ["email", "expiresAt"],
-      },
-    },
+import { PLUGIN_ID, PLUGIN_VERSION } from "./lib/context.js";
+import { ADMIN_ENTRY } from "./plugin.js";
 
-    adminPages: [
-      { path: "/settings", label: "RWStripe Settings" },
-      { path: "/restrictions", label: "RWStripe Restrictions" },
-    ],
-    adminWidgets: [
-      { id: "overview", title: "Restrict With Stripe" },
-    ],
-  };
+export { createPlugin } from "./plugin.js";
+
+export function restrictWithStripe(): PluginDescriptor {
+	return {
+		id: PLUGIN_ID,
+		version: PLUGIN_VERSION,
+		format: "native",
+		entrypoint: "emdash-restrict-with-stripe",
+		adminEntry: ADMIN_ENTRY,
+		options: {},
+	};
 }
 
 export default restrictWithStripe;

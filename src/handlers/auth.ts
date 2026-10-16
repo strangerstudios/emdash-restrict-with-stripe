@@ -1,195 +1,124 @@
-// Magic link authentication for content access
-// Sends a login email, verifies tokens, sets access cookies
+// Magic-link login for members.
 //
-// Flow:
-//   1. POST /auth/send-link  { email } → sends magic link email
-//   2. GET  /auth/verify?token=xxx    → validates token, sets cookie, redirects
-//   3. GET  /auth/logout              → clears cookie, redirects
+//   POST auth/send-link {email, return_path} -> emails <site><return_path>?rwstripe_login=<token>
+//   POST auth/verify    {token}              -> {session, email, expiresAt}
+//   POST auth/logout    {session}            -> {ok}
 //
-// The cookie (rwstripe_session) maps to an email in plugin storage.
-// Access checks look up email → Stripe customer → verify purchase.
+// The page script reads rwstripe_login from the URL and POSTs it, so link
+// scanners that prefetch the GET URL cannot burn the token.
 
-import { StripeClient } from "../stripe.js";
+import { getStripeConfig } from "../lib/config.js";
+import { type Ctx, fail, type RCtx, requireHttp, requireSiteOrigin } from "../lib/context.js";
+import { maybePurgeExpired } from "../lib/cleanup.js";
+import { checkLimits, WINDOW_15_MIN } from "../lib/ratelimit.js";
+import {
+	LOGIN_TOKEN_TTL_MS,
+	consumeLoginToken,
+	createLoginToken,
+	createSession,
+	deleteSession,
+} from "../lib/sessions.js";
+import { notePermissionError } from "../lib/permissions.js";
+import { StripeClient } from "../lib/stripe.js";
+import { referencedProductIds } from "../lib/restrictions.js";
+import { appendRawParam, emailLookupVariants, escapeHtml, normalizeEmail, validateReturnPath } from "../lib/validate.js";
+import { body } from "./util.js";
 
-function generateToken(): string {
-  const chars = "abcdefghijklmnopqrstuvwxyz0123456789";
-  let token = "";
-  for (let i = 0; i < 48; i++) token += chars[Math.floor(Math.random() * chars.length)];
-  return token;
+export const LOGIN_PARAM = "rwstripe_login";
+
+const GENERIC_SENT = {
+	ok: true,
+	message: "If that email has a purchase on this site, a login link is on its way.",
+} as const;
+
+export async function sendLinkHandler(ctx: RCtx): Promise<typeof GENERIC_SENT> {
+	const input = body(ctx);
+	const siteOrigin = requireSiteOrigin(ctx);
+	const email = normalizeEmail(input.email);
+	if (!email) fail("INVALID_EMAIL", "Enter a valid email address.");
+	const returnPath = validateReturnPath(input.return_path, siteOrigin);
+	if (!returnPath) fail("INVALID_RETURN_PATH", "return_path must be a path on this site.");
+	if (!ctx.email) {
+		fail("EMAIL_NOT_CONFIGURED", "This site cannot send email yet, so login links are unavailable.", 503);
+	}
+	const config = await getStripeConfig(ctx);
+	if (!config) fail("STRIPE_NOT_CONFIGURED", "Stripe is not connected for this site.", 503);
+
+	const allowed = await checkLimits(ctx, "send-link", {
+		email: { value: email, rule: { max: 3, windowMs: WINDOW_15_MIN } },
+		ip: { max: 10, windowMs: WINDOW_15_MIN },
+	});
+	if (!allowed) {
+		ctx.log.info("Login link rate limited");
+		return GENERIC_SENT;
+	}
+	await maybePurgeExpired(ctx);
+
+	// Mail goes only to addresses whose Stripe customers hold a product that restricts
+	// content, so the route cannot send login email to arbitrary addresses (customers
+	// alone are not enough: anyone can create one by completing a free checkout).
+	// The response is identical either way.
+	const lookupEmails = emailLookupVariants(input.email);
+	try {
+		const stripe = new StripeClient(config.secretKey, requireHttp(ctx).fetch);
+		const products = [...(await referencedProductIds(ctx))];
+		let eligible = false;
+		for (const customerId of await stripe.customersFor({ customerId: null, lookupEmails })) {
+			if (await stripe.customerHasProduct(customerId, products)) {
+				eligible = true;
+				break;
+			}
+		}
+		if (!eligible) return GENERIC_SENT;
+	} catch (error) {
+		ctx.log.warn("Stripe lookup for login link failed", { error: String(error) });
+		await notePermissionError(ctx, "login link lookup", error);
+		return GENERIC_SENT;
+	}
+
+	const token = await createLoginToken(ctx, email, returnPath, Date.now(), lookupEmails);
+	const link = appendRawParam(`${siteOrigin}${returnPath}`, LOGIN_PARAM, token);
+	await sendLoginEmail(ctx, email, link);
+	return GENERIC_SENT;
 }
 
-// POST /auth/send-link — sends magic link email
-export async function sendLinkHandler(ctx: any) {
-  const body = ctx.input || {};
-  const email = (body.email || "").trim().toLowerCase();
-
-  if (!email || !email.includes("@")) {
-    return { error: "Valid email required." };
-  }
-
-  // Generate a token that expires in 15 minutes
-  const token = generateToken();
-  const expiresAt = new Date(Date.now() + 15 * 60 * 1000).toISOString();
-
-  // Store the token
-  await ctx.storage.authTokens.put(token, {
-    email,
-    token,
-    expiresAt,
-    used: false,
-    createdAt: new Date().toISOString(),
-  });
-
-  // Build the verify URL — points to the Astro page that handles cookie setting
-  const siteUrl = new URL(ctx.request.url).origin;
-  const verifyUrl = `${siteUrl}/account/verify?token=${encodeURIComponent(token)}&redirect=${encodeURIComponent(body.redirect || "/")}`;
-
-  // Send email via SMTP (localhost:1025 for Mailpit, or configurable)
-  const smtpHost = (await ctx.kv.get("smtp_host")) || "127.0.0.1";
-  const smtpPort = parseInt((await ctx.kv.get("smtp_port")) || "1025", 10);
-  const fromEmail = (await ctx.kv.get("from_email")) || "noreply@emdash.local";
-  const siteName = (await ctx.kv.get("site_name")) || "EmDash Site";
-
-  const emailBody = [
-    `From: ${siteName} <${fromEmail}>`,
-    `To: ${email}`,
-    `Subject: Your login link`,
-    `Content-Type: text/html; charset=utf-8`,
-    ``,
-    `<p>Click the link below to log in:</p>`,
-    `<p><a href="${verifyUrl}" style="display:inline-block;padding:10px 20px;background:#635bff;color:white;text-decoration:none;border-radius:6px;font-weight:500">Log In</a></p>`,
-    `<p style="color:#6b7280;font-size:13px">This link expires in 15 minutes. If you didn't request this, you can safely ignore this email.</p>`,
-  ].join("\r\n");
-
-  try {
-    // Use raw TCP to send via SMTP (works in Node.js runtime)
-    // For Cloudflare Workers, would need a different approach (Resend/SES API)
-    const net = await import("node:net");
-    await new Promise<void>((resolve, reject) => {
-      const socket = net.createConnection(smtpPort, smtpHost, () => {
-        let step = 0;
-        const commands = [
-          `EHLO emdash.local`,
-          `MAIL FROM:<${fromEmail}>`,
-          `RCPT TO:<${email}>`,
-          `DATA`,
-          emailBody + "\r\n.",
-          `QUIT`,
-        ];
-
-        socket.on("data", () => {
-          if (step < commands.length) {
-            socket.write(commands[step] + "\r\n");
-            step++;
-          }
-        });
-
-        socket.on("end", resolve);
-        socket.on("error", reject);
-
-        setTimeout(() => { socket.destroy(); resolve(); }, 5000);
-      });
-    });
-  } catch (err: any) {
-    console.error("[rwstripe] Failed to send email:", err.message);
-    return { error: "Failed to send login email. Check SMTP configuration." };
-  }
-
-  return { ok: true, message: "Check your inbox for a login link." };
+async function sendLoginEmail(ctx: Ctx, to: string, link: string): Promise<void> {
+	const siteName = ctx.site.name || new URL(link).hostname;
+	const minutes = LOGIN_TOKEN_TTL_MS / 60000;
+	const text = [
+		`Log in to ${siteName}: ${link}`,
+		"",
+		`This link expires in ${minutes} minutes and works once. If you didn't request it, you can ignore this email.`,
+	].join("\n");
+	const html = [
+		`<p>Click the button below to log in to ${escapeHtml(siteName)}.</p>`,
+		`<p><a href="${escapeHtml(link)}" style="display:inline-block;padding:10px 20px;background:#635bff;color:#ffffff;text-decoration:none;border-radius:6px;font-weight:500">Log In</a></p>`,
+		`<p style="color:#6b7280;font-size:13px">This link expires in ${minutes} minutes and works once. If you didn't request it, you can ignore this email.</p>`,
+	].join("\n");
+	try {
+		await ctx.email!.send({ to, subject: `Your login link for ${siteName}`, text, html });
+	} catch (error) {
+		// Not surfaced to the caller: a distinct error here would reveal that the address is a customer.
+		ctx.log.error("Login email failed to send", { error: String(error) });
+	}
 }
 
-// GET /auth/verify — validates token, sets cookie, redirects
-export async function verifyHandler(ctx: any) {
-  const url = new URL(ctx.request.url);
-  const token = url.searchParams.get("token");
-  const redirect = url.searchParams.get("redirect") || "/";
+export async function verifyHandler(
+	ctx: RCtx,
+): Promise<{ session: string; email: string; expiresAt: string; returnPath: string }> {
+	const input = body(ctx);
+	const allowed = await checkLimits(ctx, "verify", { ip: { max: 20, windowMs: WINDOW_15_MIN } });
+	if (!allowed) fail("RATE_LIMITED", "Too many attempts. Try again in a few minutes.", 429);
 
-  if (!token) {
-    return { __html: errorPage("Invalid login link.") };
-  }
-
-  // Look up the token
-  const record = await ctx.storage.authTokens.get(token);
-  if (!record) {
-    return { __html: errorPage("Login link not found or expired.") };
-  }
-
-  const data = record.data || record;
-
-  // Check expiration
-  if (new Date(data.expiresAt) < new Date()) {
-    await ctx.storage.authTokens.delete(token);
-    return { __html: errorPage("Login link has expired. Please request a new one.") };
-  }
-
-  // Check if already used
-  if (data.used) {
-    return { __html: errorPage("This login link has already been used.") };
-  }
-
-  // Mark as used
-  await ctx.storage.authTokens.put(token, { ...data, used: true });
-
-  // Generate a session token (long-lived, 30 days)
-  const sessionToken = generateToken();
-  const sessionExpires = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
-
-  await ctx.storage.sessions.put(sessionToken, {
-    email: data.email,
-    sessionToken,
-    expiresAt: sessionExpires,
-    createdAt: new Date().toISOString(),
-  });
-
-  // Plugin routes always return JSON — we can't return raw HTML or set cookies.
-  // Instead, return the session token and redirect URL. The caller handles it.
-  // For magic link clicks from email: return a redirect URL with the session token
-  // as a query param. The frontend JS captures it and sets the cookie.
-  const sep = redirect.includes("?") ? "&" : "?";
-  const redirectUrl = `${redirect}${sep}rwstripe_session=${encodeURIComponent(sessionToken)}`;
-
-  return { ok: true, redirect: redirectUrl, sessionToken };
+	const record = await consumeLoginToken(ctx, input.token);
+	if (!record) {
+		fail("INVALID_LOGIN_LINK", "This login link is invalid, expired, or already used. Request a new one.");
+	}
+	const session = await createSession(ctx, record.email, Date.now(), { lookupEmails: record.lookupEmails });
+	return { session: session.token, email: record.email, expiresAt: session.expiresAt, returnPath: record.returnPath };
 }
 
-// GET /auth/logout — clears session
-export async function logoutHandler(ctx: any) {
-  const url = new URL(ctx.request.url);
-  const redirect = url.searchParams.get("redirect") || "/";
-
-  return {
-    __html: `<!DOCTYPE html><html><head><meta charset="utf-8"><title>Logging out...</title></head><body>
-<script>
-document.cookie = "rwstripe_session=; path=/; max-age=0";
-localStorage.removeItem("rwstripe_token");
-window.location.href = ${JSON.stringify(redirect)};
-</script>
-<p>Logging you out...</p>
-</body></html>`,
-  };
-}
-
-// Helper: look up session from cookie in request
-export async function getSessionEmail(ctx: any): Promise<string | null> {
-  const cookieHeader = ctx.request.headers.get("cookie") || "";
-  const match = cookieHeader.match(/rwstripe_session=([^;]+)/);
-  if (!match) return null;
-
-  const sessionToken = match[1];
-  const record = await ctx.storage.sessions.get(sessionToken);
-  if (!record) return null;
-
-  const data = record.data || record;
-  if (new Date(data.expiresAt) < new Date()) {
-    await ctx.storage.sessions.delete(sessionToken);
-    return null;
-  }
-
-  return data.email;
-}
-
-function errorPage(msg: string): string {
-  return `<!DOCTYPE html><html><head><meta charset="utf-8"><title>Error</title></head><body style="font-family:system-ui;max-width:400px;margin:4rem auto;text-align:center">
-<h2>Login Error</h2><p style="color:#dc2626">${msg}</p>
-<p><a href="javascript:history.back()">Go back</a></p>
-</body></html>`;
+export async function logoutHandler(ctx: RCtx): Promise<{ ok: true }> {
+	await deleteSession(ctx, body(ctx).session);
+	return { ok: true };
 }

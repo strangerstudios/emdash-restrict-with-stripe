@@ -1,93 +1,76 @@
-// GET access check — returns whether current user can view a content item
-// Mirrors WP rwstripe_get_restricted_products_for_post() + customer_has_product()
-import { StripeClient } from "../stripe.js";
-import { getSessionEmail } from "./auth.js";
+// POST access {collection, id, session?}: is this entry restricted, and does the
+// session's email hold one of the required products in Stripe?
 
-export async function accessHandler(ctx: any) {
-  const url = new URL(ctx.request.url);
-  const contentId = url.searchParams.get("contentId");
-  const collectionSlug = url.searchParams.get("collection");
+import { getStripeConfig } from "../lib/config.js";
+import { type Ctx, fail, type RCtx, requireHttp, store } from "../lib/context.js";
+import { sha256Hex } from "../lib/crypto.js";
+import { getRestrictedProductIds } from "../lib/restrictions.js";
+import { getSession, type SessionIdentity } from "../lib/sessions.js";
+import { notePermissionError } from "../lib/permissions.js";
+import { StripeClient } from "../lib/stripe.js";
+import { isShortString } from "../lib/validate.js";
+import { body } from "./util.js";
 
-  if (!contentId || !collectionSlug) {
-    return { error: "contentId and collection required" };
-  }
+const ACCESS_CACHE_TTL_MS = 5 * 60 * 1000;
 
-  // Collect all product IDs restricting this content
-  const productIds = await getRestrictedProductIds(ctx, collectionSlug, contentId);
-
-  if (productIds.length === 0) {
-    return { restricted: false, hasAccess: true };
-  }
-
-  // Determine the user's email from (in priority order):
-  //   1. rwstripe_session cookie (magic link login)
-  //   2. emdash logged-in user
-  let email: string | null = null;
-
-  // Check magic link session cookie
-  email = await getSessionEmail(ctx);
-
-  // Fall back to emdash user
-  if (!email && ctx.user?.email) {
-    email = ctx.user.email;
-  }
-
-  if (!email) {
-    return { restricted: true, hasAccess: false, productIds };
-  }
-
-  // Look up Stripe customer by email directly from Stripe API
-  // This is the authoritative check — no local state needed
-  const secretKey = await ctx.kv.get("stripe_secret_key");
-  if (!secretKey) {
-    return { restricted: true, hasAccess: false, error: "Stripe not configured" };
-  }
-
-  const stripe = new StripeClient(secretKey, ctx.http.fetch);
-
-  // Find customer(s) by email in Stripe
-  let customerId: string | null = null;
-  try {
-    const customers = await stripe.getCustomersByEmail(email);
-    if (customers.data && customers.data.length > 0) {
-      // Check each customer (email isn't unique in Stripe)
-      for (const cust of customers.data) {
-        const hasAccess = await stripe.customerHasProduct(cust.id, productIds);
-        if (hasAccess) {
-          return { restricted: true, hasAccess: true, productIds, email };
-        }
-      }
-      customerId = customers.data[0].id;
-    }
-  } catch (err: any) {
-    console.error("[rwstripe] Stripe lookup failed:", err.message);
-  }
-
-  return { restricted: true, hasAccess: false, productIds, email };
+export interface AccessResult {
+	restricted: boolean;
+	hasAccess: boolean;
+	productIds: string[];
+	email?: string;
+	error?: "STRIPE_NOT_CONFIGURED" | "STRIPE_UNAVAILABLE";
 }
 
-// Collect product IDs from both content restrictions and taxonomy restrictions
-// (mirrors WP: post meta + category meta + tag meta)
-async function getRestrictedProductIds(ctx: any, collectionSlug: string, contentId: string): Promise<string[]> {
-  const productIds: string[] = [];
+export async function accessHandler(ctx: RCtx): Promise<AccessResult> {
+	const input = body(ctx);
+	const { collection, id } = input;
+	if (!isShortString(collection) || !isShortString(id)) {
+		fail("INVALID_INPUT", "collection and id are required.");
+	}
 
-  // Direct content restriction
-  const restriction = await ctx.storage.restrictions.get(`${collectionSlug}:${contentId}`);
-  if (restriction) {
-    const ids = restriction.data?.productIds || restriction.productIds || [];
-    productIds.push(...ids);
-  }
+	const productIds = await getRestrictedProductIds(ctx, collection, id);
+	if (productIds.length === 0) return { restricted: false, hasAccess: true, productIds: [] };
 
-  // Taxonomy restrictions — check all taxonomy terms assigned to this content
-  // In emdash, content-taxonomy relationships are queried via content API
-  // For now, we check all taxonomy restrictions and see if the content has matching terms
-  // (This would be more efficient with a content→terms lookup, but works for POC)
-  const taxResult = await ctx.storage.taxonomyRestrictions.query({});
-  if (taxResult.items.length > 0) {
-    // We'd need content API access to check which terms this content has
-    // For POC, taxonomy restrictions are checked at the Astro template level
-    // since we need to query the content's terms from the CMS
-  }
+	const identity = await getSession(ctx, input.session);
+	if (!identity) return { restricted: true, hasAccess: false, productIds };
 
-  return [...new Set(productIds)];
+	const check = await identityHasAccess(ctx, identity, productIds);
+	const result: AccessResult = { restricted: true, hasAccess: check.hasAccess, productIds, email: identity.email };
+	if (check.error) result.error = check.error;
+	return result;
+}
+
+/**
+ * Positive results are cached for five minutes per Stripe key, session scope, and
+ * product set; negatives are not.
+ */
+export async function identityHasAccess(
+	ctx: Ctx,
+	identity: SessionIdentity,
+	productIds: readonly string[],
+	now = Date.now(),
+): Promise<{ hasAccess: boolean; error?: AccessResult["error"] }> {
+	const config = await getStripeConfig(ctx);
+	if (!config) return { hasAccess: false, error: "STRIPE_NOT_CONFIGURED" };
+
+	const cache = store<{ expiresAt: string }>(ctx, "accessCache");
+	const scope = identity.customerId ? `customer:${identity.customerId}` : `email:${identity.lookupEmails.join(",")}`;
+	const cacheKey = await sha256Hex(`${config.keyHash}\n${scope}\n${[...productIds].sort().join(",")}`);
+	const cached = await cache.get(cacheKey);
+	if (cached && Date.parse(cached.expiresAt) > now) return { hasAccess: true };
+
+	const stripe = new StripeClient(config.secretKey, requireHttp(ctx).fetch);
+	try {
+		for (const customerId of await stripe.customersFor(identity)) {
+			if (await stripe.customerHasProduct(customerId, productIds)) {
+				await cache.put(cacheKey, { expiresAt: new Date(now + ACCESS_CACHE_TTL_MS).toISOString() });
+				return { hasAccess: true };
+			}
+		}
+	} catch (error) {
+		ctx.log.warn("Stripe access lookup failed", { error: String(error) });
+		await notePermissionError(ctx, "access check", error);
+		return { hasAccess: false, error: "STRIPE_UNAVAILABLE" };
+	}
+	return { hasAccess: false };
 }
